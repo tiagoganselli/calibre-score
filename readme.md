@@ -1,8 +1,8 @@
 # About
 
-Calibre Web is a web app providing a clean interface for browsing, reading and downloading eBooks using an existing [Calibre](https://calibre-ebook.com) database.
+Calibre Score is a web app providing a clean interface for browsing, reading and downloading Music Scores using an existing [Calibre](https://calibre-ebook.com) database.
 
-*This software is a fork of [library](https://github.com/mutschler/calibreserver) and licensed under the GPL v3 License.*
+*This software is a fork of [calibre-web](https://github.com/janeczku/calibre-web)*
 
 ![screenshot](https://raw.githubusercontent.com/janeczku/docker-calibre-web/master/screenshot.png)
 
