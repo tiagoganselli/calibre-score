@@ -1,101 +1,102 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-from sqlalchemy import *
-from sqlalchemy import exc
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import *
-from flask_login import AnonymousUserMixin
-import sys
+#  This file is part of the Calibre-Web (https://github.com/janeczku/calibre-web)
+#    Copyright (C) 2012-2019 mutschler, jkrehm, cervinko, janeczku, OzzieIsaacs, csitko
+#                            ok11, issmirnov, idalin
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+from __future__ import division, print_function, unicode_literals
 import os
-import logging
-from werkzeug.security import generate_password_hash
-from flask_babel import gettext as _
-import json
+import sys
 import datetime
+import itertools
+import uuid
+from flask import session as flask_session
 from binascii import hexlify
 
-dbpath = os.path.join(os.path.normpath(os.getenv("CALIBRE_DBPATH", os.path.dirname(os.path.realpath(__file__)) + os.sep + ".." + os.sep)), "app.db")
-engine = create_engine('sqlite:///{0}'.format(dbpath), echo=False)
+from flask_login import AnonymousUserMixin, current_user
+
+try:
+    from flask_dance.consumer.backend.sqla import OAuthConsumerMixin
+    oauth_support = True
+except ImportError:
+    # fails on flask-dance >1.3, due to renaming
+    try:
+        from flask_dance.consumer.storage.sqla import OAuthConsumerMixin
+        oauth_support = True
+    except ImportError:
+        oauth_support = False
+from sqlalchemy import create_engine, exc, exists, event
+from sqlalchemy import Column, ForeignKey
+from sqlalchemy import String, Integer, SmallInteger, Boolean, DateTime, Float, JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy.orm import backref, relationship, sessionmaker, Session, scoped_session
+from werkzeug.security import generate_password_hash
+
+from . import constants
+
+
+session = None
+app_DB_path = None
 Base = declarative_base()
-
-ROLE_USER = 0
-ROLE_ADMIN = 1
-ROLE_DOWNLOAD = 2
-ROLE_UPLOAD = 4
-ROLE_EDIT = 8
-ROLE_PASSWD = 16
-ROLE_ANONYMOUS = 32
-ROLE_EDIT_SHELFS = 64
-ROLE_DELETE_BOOKS = 128
+searched_ids = {}
 
 
-DETAIL_RANDOM = 1
-SIDEBAR_LANGUAGE = 2
-SIDEBAR_SERIES = 4
-SIDEBAR_CATEGORY = 8
-SIDEBAR_HOT = 16
-SIDEBAR_RANDOM = 32
-SIDEBAR_AUTHOR = 64
-SIDEBAR_BEST_RATED = 128
-SIDEBAR_READ_AND_UNREAD = 256
-
-DEFAULT_PASS = "admin123"
-DEFAULT_PORT = int(os.environ.get("CALIBRE_PORT", 8083))
-
-
-
-DEVELOPMENT = False
-
-
+def store_ids(result):
+    ids = list()
+    for element in result:
+        ids.append(element.id)
+    searched_ids[current_user.id] = ids
 
 
 class UserBase:
+
     @property
     def is_authenticated(self):
         return True
 
+    def _has_role(self, role_flag):
+        return constants.has_flag(self.role, role_flag)
+
     def role_admin(self):
-        if self.role is not None:
-            return True if self.role & ROLE_ADMIN == ROLE_ADMIN else False
-        else:
-            return False
+        return self._has_role(constants.ROLE_ADMIN)
 
     def role_download(self):
-        if self.role is not None:
-            return True if self.role & ROLE_DOWNLOAD == ROLE_DOWNLOAD else False
-        else:
-            return False
+        return self._has_role(constants.ROLE_DOWNLOAD)
 
     def role_upload(self):
-        return bool((self.role is not None)and(self.role & ROLE_UPLOAD == ROLE_UPLOAD))
+        return self._has_role(constants.ROLE_UPLOAD)
 
     def role_edit(self):
-        if self.role is not None:
-            return True if self.role & ROLE_EDIT == ROLE_EDIT else False
-        else:
-            return False
+        return self._has_role(constants.ROLE_EDIT)
 
     def role_passwd(self):
-        if self.role is not None:
-            return True if self.role & ROLE_PASSWD == ROLE_PASSWD else False
-        else:
-            return False
+        return self._has_role(constants.ROLE_PASSWD)
 
     def role_anonymous(self):
-        if self.role is not None:
-            return True if self.role & ROLE_ANONYMOUS == ROLE_ANONYMOUS else False
-        else:
-            return False
+        return self._has_role(constants.ROLE_ANONYMOUS)
 
     def role_edit_shelfs(self):
-        if self.role is not None:
-            return True if self.role & ROLE_EDIT_SHELFS == ROLE_EDIT_SHELFS else False
-        else:
-            return False
+        return self._has_role(constants.ROLE_EDIT_SHELFS)
 
     def role_delete_books(self):
-        return bool((self.role is not None)and(self.role & ROLE_DELETE_BOOKS == ROLE_DELETE_BOOKS))
+        return self._has_role(constants.ROLE_DELETE_BOOKS)
+
+    def role_viewer(self):
+        return self._has_role(constants.ROLE_VIEWER)
 
     @property
     def is_active(self):
@@ -103,7 +104,7 @@ class UserBase:
 
     @property
     def is_anonymous(self):
-        return False
+        return self.role_anonymous()
 
     def get_id(self):
         return str(self.id)
@@ -111,73 +112,123 @@ class UserBase:
     def filter_language(self):
         return self.default_language
 
-    def show_random_books(self):
-        return bool((self.sidebar_view is not None)and(self.sidebar_view & SIDEBAR_RANDOM == SIDEBAR_RANDOM))
-
-    def show_language(self):
-        return bool((self.sidebar_view is not None)and(self.sidebar_view & SIDEBAR_LANGUAGE == SIDEBAR_LANGUAGE))
-
-    def show_hot_books(self):
-        return bool((self.sidebar_view is not None)and(self.sidebar_view & SIDEBAR_HOT == SIDEBAR_HOT))
-
-    def show_series(self):
-        return bool((self.sidebar_view is not None)and(self.sidebar_view & SIDEBAR_SERIES == SIDEBAR_SERIES))
-
-    def show_category(self):
-        return bool((self.sidebar_view is not None)and(self.sidebar_view & SIDEBAR_CATEGORY == SIDEBAR_CATEGORY))
-
-    def show_author(self):
-        return bool((self.sidebar_view is not None)and(self.sidebar_view & SIDEBAR_AUTHOR == SIDEBAR_AUTHOR))
-
-    def show_best_rated_books(self):
-        return bool((self.sidebar_view is not None)and(self.sidebar_view & SIDEBAR_BEST_RATED == SIDEBAR_BEST_RATED))
-
-    def show_read_and_unread(self):
-        return bool((self.sidebar_view is not None)and(self.sidebar_view & SIDEBAR_READ_AND_UNREAD == SIDEBAR_READ_AND_UNREAD))
+    def check_visibility(self, value):
+        if value == constants.SIDEBAR_RECENT:
+            return True
+        return constants.has_flag(self.sidebar_view, value)
 
     def show_detail_random(self):
-        return bool((self.sidebar_view is not None)and(self.sidebar_view & DETAIL_RANDOM == DETAIL_RANDOM))
+        return self.check_visibility(constants.DETAIL_RANDOM)
+
+    def list_denied_tags(self):
+        mct = self.denied_tags or ""
+        return [t.strip() for t in mct.split(",")]
+
+    def list_allowed_tags(self):
+        mct = self.allowed_tags or ""
+        return [t.strip() for t in mct.split(",")]
+
+    def list_denied_column_values(self):
+        mct = self.denied_column_value or ""
+        return [t.strip() for t in mct.split(",")]
+
+    def list_allowed_column_values(self):
+        mct = self.allowed_column_value or ""
+        return [t.strip() for t in mct.split(",")]
+
+    def get_view_property(self, page, property):
+        if not self.view_settings.get(page):
+            return None
+        return self.view_settings[page].get(property)
+
+    def set_view_property(self, page, property, value):
+        if not self.view_settings.get(page):
+            self.view_settings[page] = dict()
+        self.view_settings[page][property] = value
+        try:
+            flag_modified(self, "view_settings")
+        except AttributeError:
+            pass
+        try:
+            session.commit()
+        except (exc.OperationalError, exc.InvalidRequestError):
+            session.rollback()
+            # ToDo: Error message
 
     def __repr__(self):
         return '<User %r>' % self.nickname
 
 
-# Baseclass for Users in Calibre-web, settings which are depending on certain users are stored here. It is derived from
+# Baseclass for Users in Calibre-Web, settings which are depending on certain users are stored here. It is derived from
 # User Base (all access methods are declared there)
 class User(UserBase, Base):
     __tablename__ = 'user'
+    __table_args__ = {'sqlite_autoincrement': True}
 
     id = Column(Integer, primary_key=True)
     nickname = Column(String(64), unique=True)
     email = Column(String(120), unique=True, default="")
-    role = Column(SmallInteger, default=ROLE_USER)
+    role = Column(SmallInteger, default=constants.ROLE_USER)
     password = Column(String)
     kindle_mail = Column(String(120), default="")
-    shelf = relationship('Shelf', backref='user', lazy='dynamic')
+    shelf = relationship('Shelf', backref='user', lazy='dynamic', order_by='Shelf.name')
     downloads = relationship('Downloads', backref='user', lazy='dynamic')
     locale = Column(String(2), default="en")
     sidebar_view = Column(Integer, default=1)
     default_language = Column(String(3), default="all")
     mature_content = Column(Boolean, default=True)
+    denied_tags = Column(String, default="")
+    allowed_tags = Column(String, default="")
+    denied_column_value = Column(String, default="")
+    allowed_column_value = Column(String, default="")
+    remote_auth_token = relationship('RemoteAuthToken', backref='user', lazy='dynamic')
+    view_settings = Column(JSON, default={})
 
 
-# Class for anonymous user is derived from User base and complets overrides methods and properties for the
+
+if oauth_support:
+    class OAuth(OAuthConsumerMixin, Base):
+        provider_user_id = Column(String(256))
+        user_id = Column(Integer, ForeignKey(User.id))
+        user = relationship(User)
+
+
+class OAuthProvider(Base):
+    __tablename__ = 'oauthProvider'
+
+    id = Column(Integer, primary_key=True)
+    provider_name = Column(String)
+    oauth_client_id = Column(String)
+    oauth_client_secret = Column(String)
+    active = Column(Boolean)
+
+
+# Class for anonymous user is derived from User base and completly overrides methods and properties for the
 # anonymous user
 class Anonymous(AnonymousUserMixin, UserBase):
     def __init__(self):
         self.loadSettings()
 
     def loadSettings(self):
-        data = session.query(User).filter(User.role.op('&')(ROLE_ANONYMOUS) == ROLE_ANONYMOUS).first()  # type: User
-        settings = session.query(Settings).first()
+        data = session.query(User).filter(User.role.op('&')(constants.ROLE_ANONYMOUS) == constants.ROLE_ANONYMOUS)\
+            .first()  # type: User
         self.nickname = data.nickname
         self.role = data.role
         self.id=data.id
         self.sidebar_view = data.sidebar_view
         self.default_language = data.default_language
         self.locale = data.locale
-        self.mature_content = data.mature_content
-        self.anon_browse = settings.config_anonbrowse
+        # self.mature_content = data.mature_content
+        self.kindle_mail = data.kindle_mail
+        self.denied_tags = data.denied_tags
+        self.allowed_tags = data.allowed_tags
+        self.denied_column_value = data.denied_column_value
+        self.allowed_column_value = data.allowed_column_value
+        self.view_settings = data.view_settings
+        # Initialize flask_session once
+        if 'view' not in flask_session:
+            flask_session['view']={}
+
 
     def role_admin(self):
         return False
@@ -188,26 +239,41 @@ class Anonymous(AnonymousUserMixin, UserBase):
 
     @property
     def is_anonymous(self):
-        return self.anon_browse
+        return True
 
     @property
     def is_authenticated(self):
         return False
 
-# Baseclass representing Shelfs in calibre-web inapp.db
+    def get_view_property(self, page, prop):
+        if not flask_session['view'].get(page):
+            return None
+        return flask_session['view'][page].get(prop)
+
+    def set_view_property(self, page, prop, value):
+        if not flask_session['view'].get(page):
+            flask_session['view'][page] = dict()
+        flask_session['view'][page][prop] = value
+
+
+# Baseclass representing Shelfs in calibre-web in app.db
 class Shelf(Base):
     __tablename__ = 'shelf'
 
     id = Column(Integer, primary_key=True)
+    uuid = Column(String, default=lambda: str(uuid.uuid4()))
     name = Column(String)
     is_public = Column(Integer, default=0)
     user_id = Column(Integer, ForeignKey('user.id'))
+    books = relationship("BookShelf", backref="ub_shelf", cascade="all, delete-orphan", lazy="dynamic")
+    created = Column(DateTime, default=datetime.datetime.utcnow)
+    last_modified = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
     def __repr__(self):
-        return '<Shelf %r>' % self.name
+        return '<Shelf %d:%r>' % (self.id, self.name)
 
 
-# Baseclass representing Relationship between books and Shelfs in Calibre-web in app.db (N:M)
+# Baseclass representing Relationship between books and Shelfs in Calibre-Web in app.db (N:M)
 class BookShelf(Base):
     __tablename__ = 'book_shelf_link'
 
@@ -215,18 +281,42 @@ class BookShelf(Base):
     book_id = Column(Integer)
     order = Column(Integer)
     shelf = Column(Integer, ForeignKey('shelf.id'))
+    date_added = Column(DateTime, default=datetime.datetime.utcnow)
 
     def __repr__(self):
         return '<Book %r>' % self.id
 
 
+# This table keeps track of deleted Shelves so that deletes can be propagated to any paired Kobo device.
+class ShelfArchive(Base):
+    __tablename__ = 'shelf_archive'
+
+    id = Column(Integer, primary_key=True)
+    uuid = Column(String)
+    user_id = Column(Integer, ForeignKey('user.id'))
+    last_modified = Column(DateTime, default=datetime.datetime.utcnow)
+
+
 class ReadBook(Base):
     __tablename__ = 'book_read_link'
+
+    STATUS_UNREAD = 0
+    STATUS_FINISHED = 1
+    STATUS_IN_PROGRESS = 2
 
     id = Column(Integer, primary_key=True)
     book_id = Column(Integer, unique=False)
     user_id = Column(Integer, ForeignKey('user.id'), unique=False)
-    is_read = Column(Boolean, unique=False)
+    read_status = Column(Integer, unique=False, default=STATUS_UNREAD, nullable=False)
+    kobo_reading_state = relationship("KoboReadingState", uselist=False,
+                                      primaryjoin="and_(ReadBook.user_id == foreign(KoboReadingState.user_id), "
+                                                  "ReadBook.book_id == foreign(KoboReadingState.book_id))",
+                                      cascade="all",
+                                      backref=backref("book_read_link",
+                                                      uselist=False))
+    last_modified = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    last_time_started_reading = Column(DateTime, nullable=True)
+    times_started_reading = Column(Integer, default=0, nullable=False)
 
 
 class Bookmark(Base):
@@ -237,6 +327,69 @@ class Bookmark(Base):
     book_id = Column(Integer)
     format = Column(String(collation='NOCASE'))
     bookmark_key = Column(String)
+
+
+# Baseclass representing books that are archived on the user's Kobo device.
+class ArchivedBook(Base):
+    __tablename__ = 'archived_book'
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('user.id'))
+    book_id = Column(Integer)
+    is_archived = Column(Boolean, unique=False)
+    last_modified = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+# The Kobo ReadingState API keeps track of 4 timestamped entities:
+#   ReadingState, StatusInfo, Statistics, CurrentBookmark
+# Which we map to the following 4 tables:
+#   KoboReadingState, ReadBook, KoboStatistics and KoboBookmark
+class KoboReadingState(Base):
+    __tablename__ = 'kobo_reading_state'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey('user.id'))
+    book_id = Column(Integer)
+    last_modified = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    priority_timestamp = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    current_bookmark = relationship("KoboBookmark", uselist=False, backref="kobo_reading_state", cascade="all")
+    statistics = relationship("KoboStatistics", uselist=False, backref="kobo_reading_state", cascade="all")
+
+
+class KoboBookmark(Base):
+    __tablename__ = 'kobo_bookmark'
+
+    id = Column(Integer, primary_key=True)
+    kobo_reading_state_id = Column(Integer, ForeignKey('kobo_reading_state.id'))
+    last_modified = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    location_source = Column(String)
+    location_type = Column(String)
+    location_value = Column(String)
+    progress_percent = Column(Float)
+    content_source_progress_percent = Column(Float)
+
+
+class KoboStatistics(Base):
+    __tablename__ = 'kobo_statistics'
+
+    id = Column(Integer, primary_key=True)
+    kobo_reading_state_id = Column(Integer, ForeignKey('kobo_reading_state.id'))
+    last_modified = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    remaining_time_minutes = Column(Integer)
+    spent_reading_minutes = Column(Integer)
+
+
+# Updates the last_modified timestamp in the KoboReadingState table if any of its children tables are modified.
+@event.listens_for(Session, 'before_flush')
+def receive_before_flush(session, flush_context, instances):
+    for change in itertools.chain(session.new, session.dirty):
+        if isinstance(change, (ReadBook, KoboStatistics, KoboBookmark)):
+            if change.kobo_reading_state:
+                change.kobo_reading_state.last_modified = datetime.datetime.utcnow()
+    # Maintain the last_modified bit for the Shelf table.
+    for change in itertools.chain(session.new, session.deleted):
+        if isinstance(change, BookShelf):
+            change.ub_shelf.last_modified = datetime.datetime.utcnow()
 
 
 # Baseclass representing Downloads from calibre-web in app.db
@@ -251,323 +404,236 @@ class Downloads(Base):
         return '<Download %r' % self.book_id
 
 
-# Baseclass for representing settings in app.db with email server settings and Calibre database settings
-# (application settings)
-class Settings(Base):
-    __tablename__ = 'settings'
+# Baseclass representing allowed domains for registration
+class Registration(Base):
+    __tablename__ = 'registration'
 
     id = Column(Integer, primary_key=True)
-    mail_server = Column(String)
-    mail_port = Column(Integer, default=25)
-    mail_use_ssl = Column(SmallInteger, default=0)
-    mail_login = Column(String)
-    mail_password = Column(String)
-    mail_from = Column(String)
-    config_calibre_dir = Column(String)
-    config_port = Column(Integer, default=DEFAULT_PORT)
-    config_calibre_web_title = Column(String, default=u'Calibre-web')
-    config_books_per_page = Column(Integer, default=60)
-    config_random_books = Column(Integer, default=4)
-    config_title_regex = Column(String, default=u'^(A|The|An|Der|Die|Das|Den|Ein|Eine|Einen|Dem|Des|Einem|Eines)\s+')
-    config_log_level = Column(SmallInteger, default=logging.INFO)
-    config_uploading = Column(SmallInteger, default=0)
-    config_anonbrowse = Column(SmallInteger, default=0)
-    config_public_reg = Column(SmallInteger, default=0)
-    config_default_role = Column(SmallInteger, default=0)
-    config_columns_to_ignore = Column(String)
-    config_use_google_drive = Column(Boolean)
-    config_google_drive_client_id = Column(String)
-    config_google_drive_client_secret = Column(String)
-    config_google_drive_folder = Column(String)
-    config_google_drive_calibre_url_base = Column(String)
-    config_google_drive_watch_changes_response = Column(String)
-    config_columns_to_ignore = Column(String)
-    config_remote_login = Column(Boolean)
-    config_use_goodreads = Column(Boolean)
-    config_goodreads_api_key = Column(String)
-    config_goodreads_api_secret = Column(String)
-    config_mature_content_tags = Column(String)  # type: str
+    domain = Column(String)
+    allow = Column(Integer)
 
     def __repr__(self):
-        pass
+        return u"<Registration('{0}')>".format(self.domain)
 
 
 class RemoteAuthToken(Base):
     __tablename__ = 'remote_auth_token'
 
     id = Column(Integer, primary_key=True)
-    auth_token = Column(String(8), unique=True)
+    auth_token = Column(String, unique=True)
     user_id = Column(Integer, ForeignKey('user.id'))
     verified = Column(Boolean, default=False)
     expiration = Column(DateTime)
+    token_type = Column(Integer, default=0)
 
     def __init__(self):
-        self.auth_token = hexlify(os.urandom(4))
+        self.auth_token = (hexlify(os.urandom(4))).decode('utf-8')
         self.expiration = datetime.datetime.now() + datetime.timedelta(minutes=10)  # 10 min from now
 
     def __repr__(self):
         return '<Token %r>' % self.id
 
 
-# Class holds all application specific settings in calibre-web
-class Config:
-    def __init__(self):
-        self.config_main_dir = os.path.join(os.path.normpath(os.path.dirname(
-            os.path.realpath(__file__)) + os.sep + ".." + os.sep))
-        self.db_configured = None
-        self.loadSettings()
-
-    def loadSettings(self):
-        data = session.query(Settings).first()  # type: Settings
-        self.config_calibre_dir = data.config_calibre_dir
-        self.config_port = data.config_port
-        self.config_calibre_web_title = data.config_calibre_web_title
-        self.config_books_per_page = data.config_books_per_page
-        self.config_random_books = data.config_random_books
-        self.config_title_regex = data.config_title_regex
-        self.config_log_level = data.config_log_level
-        self.config_uploading = data.config_uploading
-        self.config_anonbrowse = data.config_anonbrowse
-        self.config_public_reg = data.config_public_reg
-        self.config_default_role = data.config_default_role
-        self.config_columns_to_ignore = data.config_columns_to_ignore
-        self.config_use_google_drive = data.config_use_google_drive
-        self.config_google_drive_client_id = data.config_google_drive_client_id
-        self.config_google_drive_client_secret = data.config_google_drive_client_secret
-        self.config_google_drive_calibre_url_base = data.config_google_drive_calibre_url_base
-        self.config_google_drive_folder = data.config_google_drive_folder
-        if data.config_google_drive_watch_changes_response:
-            self.config_google_drive_watch_changes_response = json.loads(data.config_google_drive_watch_changes_response)
-        else:
-            self.config_google_drive_watch_changes_response=None
-        self.config_columns_to_ignore = data.config_columns_to_ignore
-        self.db_configured = bool(self.config_calibre_dir is not None and
-                (not self.config_use_google_drive or os.path.exists(self.config_calibre_dir + '/metadata.db')))
-        self.config_remote_login = data.config_remote_login
-        self.config_use_goodreads = data.config_use_goodreads
-        self.config_goodreads_api_key = data.config_goodreads_api_key
-        self.config_goodreads_api_secret = data.config_goodreads_api_secret
-        self.config_mature_content_tags = data.config_mature_content_tags
-
-    @property
-    def get_main_dir(self):
-        return self.config_main_dir
-
-    def role_admin(self):
-        if self.config_default_role is not None:
-            return True if self.config_default_role & ROLE_ADMIN == ROLE_ADMIN else False
-        else:
-            return False
-
-    def role_download(self):
-        if self.config_default_role is not None:
-            return True if self.config_default_role & ROLE_DOWNLOAD == ROLE_DOWNLOAD else False
-        else:
-            return False
-
-    def role_upload(self):
-        if self.config_default_role is not None:
-            return True if self.config_default_role & ROLE_UPLOAD == ROLE_UPLOAD else False
-        else:
-            return False
-
-    def role_edit(self):
-        if self.config_default_role is not None:
-            return True if self.config_default_role & ROLE_EDIT == ROLE_EDIT else False
-        else:
-            return False
-
-    def role_passwd(self):
-        if self.config_default_role is not None:
-            return True if self.config_default_role & ROLE_PASSWD == ROLE_PASSWD else False
-        else:
-            return False
-
-    def role_edit_shelfs(self):
-        if self.config_default_role is not None:
-            return True if self.config_default_role & ROLE_EDIT_SHELFS == ROLE_EDIT_SHELFS else False
-        else:
-            return False
-
-    def role_delete_books(self):
-        return bool((self.config_default_role is not None) and
-                    (self.config_default_role & ROLE_DELETE_BOOKS == ROLE_DELETE_BOOKS))
-
-    def mature_content_tags(self):
-        if (sys.version_info > (3, 0)): #Python3 str, Python2 unicode
-            lstrip = str.lstrip
-        else:
-            lstrip = unicode.lstrip
-        return list(map(lstrip, self.config_mature_content_tags.split(",")))
-
-    def get_Log_Level(self):
-        ret_value=""
-        if self.config_log_level == logging.INFO:
-            ret_value='INFO'
-        elif self.config_log_level == logging.DEBUG:
-            ret_value='DEBUG'
-        elif self.config_log_level == logging.WARNING:
-            ret_value='WARNING'
-        elif self.config_log_level == logging.ERROR:
-            ret_value='ERROR'
-        return ret_value
-
-
 # Migrate database to current version, has to be updated after every database change. Currently migration from
-# everywhere to curent should work. Migration is done by checking if relevant coloums are existing, and than adding
+# everywhere to current should work. Migration is done by checking if relevant columns are existing, and than adding
 # rows with SQL commands
-def migrate_Database():
+def migrate_Database(session):
+    engine = session.bind
     if not engine.dialect.has_table(engine.connect(), "book_read_link"):
         ReadBook.__table__.create(bind=engine)
     if not engine.dialect.has_table(engine.connect(), "bookmark"):
         Bookmark.__table__.create(bind=engine)
-
+    if not engine.dialect.has_table(engine.connect(), "kobo_reading_state"):
+        KoboReadingState.__table__.create(bind=engine)
+    if not engine.dialect.has_table(engine.connect(), "kobo_bookmark"):
+        KoboBookmark.__table__.create(bind=engine)
+    if not engine.dialect.has_table(engine.connect(), "kobo_statistics"):
+        KoboStatistics.__table__.create(bind=engine)
+    if not engine.dialect.has_table(engine.connect(), "archived_book"):
+        ArchivedBook.__table__.create(bind=engine)
+    if not engine.dialect.has_table(engine.connect(), "registration"):
+        Registration.__table__.create(bind=engine)
+        with engine.connect() as conn:
+            conn.execute("insert into registration (domain, allow) values('%.%',1)")
+        session.commit()
     try:
-        session.query(exists().where(User.locale)).scalar()
+        session.query(exists().where(Registration.allow)).scalar()
         session.commit()
-    except exc.OperationalError:  # Database is not compatible, some rows are missing
-        conn = engine.connect()
-        conn.execute("ALTER TABLE user ADD column locale String(2) DEFAULT 'en'")
-        conn.execute("ALTER TABLE user ADD column default_language String(3) DEFAULT 'all'")
+    except exc.OperationalError:  # Database is not compatible, some columns are missing
+        with engine.connect() as conn:
+            conn.execute("ALTER TABLE registration ADD column 'allow' INTEGER")
+            conn.execute("update registration set 'allow' = 1")
         session.commit()
     try:
-        session.query(exists().where(Settings.config_calibre_dir)).scalar()
+        session.query(exists().where(RemoteAuthToken.token_type)).scalar()
         session.commit()
-    except exc.OperationalError:  # Database is not compatible, some rows are missing
-        conn = engine.connect()
-        conn.execute("ALTER TABLE Settings ADD column `config_calibre_dir` String")
-        conn.execute("ALTER TABLE Settings ADD column `config_port` INTEGER DEFAULT 8083")
-        conn.execute("ALTER TABLE Settings ADD column `config_calibre_web_title` String DEFAULT 'Calibre-web'")
-        conn.execute("ALTER TABLE Settings ADD column `config_books_per_page` INTEGER DEFAULT 60")
-        conn.execute("ALTER TABLE Settings ADD column `config_random_books` INTEGER DEFAULT 4")
-        conn.execute("ALTER TABLE Settings ADD column `config_title_regex` String DEFAULT "
-            "'^(A|The|An|Der|Die|Das|Den|Ein|Eine|Einen|Dem|Des|Einem|Eines)\s+'")
-        conn.execute("ALTER TABLE Settings ADD column `config_log_level` SmallInteger DEFAULT " + str(logging.INFO))
-        conn.execute("ALTER TABLE Settings ADD column `config_uploading` SmallInteger DEFAULT 0")
-        conn.execute("ALTER TABLE Settings ADD column `config_anonbrowse` SmallInteger DEFAULT 0")
-        conn.execute("ALTER TABLE Settings ADD column `config_public_reg` SmallInteger DEFAULT 0")
+    except exc.OperationalError:  # Database is not compatible, some columns are missing
+        with engine.connect() as conn:
+            conn.execute("ALTER TABLE remote_auth_token ADD column 'token_type' INTEGER DEFAULT 0")
+            conn.execute("update remote_auth_token set 'token_type' = 0")
         session.commit()
-
     try:
-        session.query(exists().where(Settings.config_use_google_drive)).scalar()
+        session.query(exists().where(ReadBook.read_status)).scalar()
     except exc.OperationalError:
-        conn = engine.connect()
-        conn.execute("ALTER TABLE Settings ADD column `config_use_google_drive` INTEGER DEFAULT 0")
-        conn.execute("ALTER TABLE Settings ADD column `config_google_drive_client_id` String DEFAULT ''")
-        conn.execute("ALTER TABLE Settings ADD column `config_google_drive_client_secret` String DEFAULT ''")
-        conn.execute("ALTER TABLE Settings ADD column `config_google_drive_calibre_url_base` INTEGER DEFAULT 0")
-        conn.execute("ALTER TABLE Settings ADD column `config_google_drive_folder` String DEFAULT ''")
-        conn.execute("ALTER TABLE Settings ADD column `config_google_drive_watch_changes_response` String DEFAULT ''")
+        with engine.connect() as conn:
+            conn.execute("ALTER TABLE book_read_link ADD column 'read_status' INTEGER DEFAULT 0")
+            conn.execute("UPDATE book_read_link SET 'read_status' = 1 WHERE is_read")
+            conn.execute("ALTER TABLE book_read_link ADD column 'last_modified' DATETIME")
+            conn.execute("ALTER TABLE book_read_link ADD column 'last_time_started_reading' DATETIME")
+            conn.execute("ALTER TABLE book_read_link ADD column 'times_started_reading' INTEGER DEFAULT 0")
+        session.commit()
+    test = session.query(ReadBook).filter(ReadBook.last_modified == None).all()
+    for book in test:
+        book.last_modified = datetime.datetime.utcnow()
+    session.commit()
     try:
-        session.query(exists().where(Settings.config_columns_to_ignore)).scalar()
+        session.query(exists().where(Shelf.uuid)).scalar()
     except exc.OperationalError:
-        conn = engine.connect()
-        conn.execute("ALTER TABLE Settings ADD column `config_columns_to_ignore` String DEFAULT ''")
+        with engine.connect() as conn:
+            conn.execute("ALTER TABLE shelf ADD column 'uuid' STRING")
+            conn.execute("ALTER TABLE shelf ADD column 'created' DATETIME")
+            conn.execute("ALTER TABLE shelf ADD column 'last_modified' DATETIME")
+            conn.execute("ALTER TABLE book_shelf_link ADD column 'date_added' DATETIME")
+        for shelf in session.query(Shelf).all():
+            shelf.uuid = str(uuid.uuid4())
+            shelf.created = datetime.datetime.now()
+            shelf.last_modified = datetime.datetime.now()
+        for book_shelf in session.query(BookShelf).all():
+            book_shelf.date_added = datetime.datetime.now()
         session.commit()
     try:
-        session.query(exists().where(Settings.config_default_role)).scalar()
-        session.commit()
-    except exc.OperationalError:  # Database is not compatible, some rows are missing
-        conn = engine.connect()
-        conn.execute("ALTER TABLE Settings ADD column `config_default_role` SmallInteger DEFAULT 0")
-        session.commit()
+        # Handle table exists, but no content
+        cnt = session.query(Registration).count()
+        if not cnt:
+            with engine.connect() as conn:
+                conn.execute("insert into registration (domain, allow) values('%.%',1)")
+            session.commit()
+    except exc.OperationalError:  # Database is not writeable
+        print('Settings database is not writeable. Exiting...')
+        sys.exit(2)
     try:
         session.query(exists().where(BookShelf.order)).scalar()
-        session.commit()
-    except exc.OperationalError:  # Database is not compatible, some rows are missing
-        conn = engine.connect()
-        conn.execute("ALTER TABLE book_shelf_link ADD column 'order' INTEGER DEFAULT 1")
+    except exc.OperationalError:  # Database is not compatible, some columns are missing
+        with engine.connect() as conn:
+            conn.execute("ALTER TABLE book_shelf_link ADD column 'order' INTEGER DEFAULT 1")
         session.commit()
     try:
         create = False
         session.query(exists().where(User.sidebar_view)).scalar()
+    except exc.OperationalError:  # Database is not compatible, some columns are missing
+        with engine.connect() as conn:
+            conn.execute("ALTER TABLE user ADD column `sidebar_view` Integer DEFAULT 1")
         session.commit()
-    except exc.OperationalError:  # Database is not compatible, some rows are missing
-        conn = engine.connect()
-        conn.execute("ALTER TABLE user ADD column `sidebar_view` Integer DEFAULT 1")
-        session.commit()
-        create=True
+        create = True
     try:
         if create:
-            conn = engine.connect()
-            conn.execute("SELECT language_books FROM user")
+            with engine.connect() as conn:
+                conn.execute("SELECT language_books FROM user")
             session.commit()
     except exc.OperationalError:
-        conn = engine.connect()
-        conn.execute("UPDATE user SET 'sidebar_view' = (random_books* :side_random + language_books * :side_lang "
-            "+ series_books * :side_series + category_books * :side_category + hot_books * "
-            ":side_hot + :side_autor + :detail_random)",{'side_random': SIDEBAR_RANDOM,
-            'side_lang': SIDEBAR_LANGUAGE, 'side_series': SIDEBAR_SERIES, 'side_category': SIDEBAR_CATEGORY,
-            'side_hot': SIDEBAR_HOT, 'side_autor': SIDEBAR_AUTHOR, 'detail_random': DETAIL_RANDOM})
+        with engine.connect() as conn:
+            conn.execute("UPDATE user SET 'sidebar_view' = (random_books* :side_random + language_books * :side_lang "
+                     "+ series_books * :side_series + category_books * :side_category + hot_books * "
+                     ":side_hot + :side_autor + :detail_random)",
+                     {'side_random': constants.SIDEBAR_RANDOM, 'side_lang': constants.SIDEBAR_LANGUAGE,
+                      'side_series': constants.SIDEBAR_SERIES, 'side_category': constants.SIDEBAR_CATEGORY,
+                      'side_hot': constants.SIDEBAR_HOT, 'side_autor': constants.SIDEBAR_AUTHOR,
+                      'detail_random': constants.DETAIL_RANDOM})
         session.commit()
     try:
-        session.query(exists().where(User.mature_content)).scalar()
-    except exc.OperationalError:
-        conn = engine.connect()
-        conn.execute("ALTER TABLE user ADD column `mature_content` INTEGER DEFAULT 1")
-    if session.query(User).filter(User.role.op('&')(ROLE_ANONYMOUS) == ROLE_ANONYMOUS).first() is None:
-        create_anonymous_user()
+        session.query(exists().where(User.denied_tags)).scalar()
+    except exc.OperationalError:  # Database is not compatible, some columns are missing
+        with engine.connect() as conn:
+            conn.execute("ALTER TABLE user ADD column `denied_tags` String DEFAULT ''")
+            conn.execute("ALTER TABLE user ADD column `allowed_tags` String DEFAULT ''")
+            conn.execute("ALTER TABLE user ADD column `denied_column_value` String DEFAULT ''")
+            conn.execute("ALTER TABLE user ADD column `allowed_column_value` String DEFAULT ''")
+        session.commit()
     try:
-        session.query(exists().where(Settings.config_remote_login)).scalar()
+        session.query(exists().where(User.view_settings)).scalar()
     except exc.OperationalError:
-        conn = engine.connect()
-        conn.execute("ALTER TABLE Settings ADD column `config_remote_login` INTEGER DEFAULT 0")
-    try:
-        session.query(exists().where(Settings.config_use_goodreads)).scalar()
-    except exc.OperationalError:
-        conn = engine.connect()
-        conn.execute("ALTER TABLE Settings ADD column `config_use_goodreads` INTEGER DEFAULT 0")
-        conn.execute("ALTER TABLE Settings ADD column `config_goodreads_api_key` String DEFAULT ''")
-        conn.execute("ALTER TABLE Settings ADD column `config_goodreads_api_secret` String DEFAULT ''")
-    try:
-        session.query(exists().where(Settings.config_mature_content_tags)).scalar()
-    except exc.OperationalError:
-        conn = engine.connect()
-        conn.execute("ALTER TABLE Settings ADD column `config_mature_content_tags` String DEFAULT ''")
+        with engine.connect() as conn:
+            conn.execute("ALTER TABLE user ADD column `view_settings` VARCHAR(10) DEFAULT '{}'")
+        session.commit()
 
-def clean_database():
+    if session.query(User).filter(User.role.op('&')(constants.ROLE_ANONYMOUS) == constants.ROLE_ANONYMOUS).first() \
+        is None:
+        create_anonymous_user(session)
+    try:
+        # check if one table with autoincrement is existing (should be user table)
+        with engine.connect() as conn:
+            conn.execute("SELECT COUNT(*) FROM sqlite_sequence WHERE name='user'")
+    except exc.OperationalError:
+        # Create new table user_id and copy contents of table user into it
+        with engine.connect() as conn:
+            conn.execute("CREATE TABLE user_id (id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,"
+                     "nickname VARCHAR(64),"
+                     "email VARCHAR(120),"
+                     "role SMALLINT,"
+                     "password VARCHAR,"
+                     "kindle_mail VARCHAR(120),"
+                     "locale VARCHAR(2),"
+                     "sidebar_view INTEGER,"
+                     "default_language VARCHAR(3),"
+                     # "series_view VARCHAR(10),"
+                     "view_settings VARCHAR,"                     
+                     "UNIQUE (nickname),"
+                     "UNIQUE (email))")
+            conn.execute("INSERT INTO user_id(id, nickname, email, role, password, kindle_mail,locale,"
+                     "sidebar_view, default_language, view_settings) "
+                     "SELECT id, nickname, email, role, password, kindle_mail, locale,"
+                     "sidebar_view, default_language FROM user")
+            # delete old user table and rename new user_id table to user:
+            conn.execute("DROP TABLE user")
+            conn.execute("ALTER TABLE user_id RENAME TO user")
+        session.commit()
+
+    # Remove login capability of user Guest
+    try:
+        with engine.connect() as conn:
+            conn.execute("UPDATE user SET password='' where nickname = 'Guest' and password !=''")
+        session.commit()
+    except exc.OperationalError:
+        print('Settings database is not writeable. Exiting...')
+        sys.exit(2)
+
+
+def clean_database(session):
     # Remove expired remote login tokens
     now = datetime.datetime.now()
-    session.query(RemoteAuthToken).filter(now > RemoteAuthToken.expiration).delete()
-
-def create_default_config():
-    settings = Settings()
-    settings.mail_server = "mail.example.com"
-    settings.mail_port = 25
-    settings.mail_use_ssl = 0
-    settings.mail_login = "mail@example.com"
-    settings.mail_password = "mypassword"
-    settings.mail_from = "automailer <mail@example.com>"
-
-    session.add(settings)
+    session.query(RemoteAuthToken).filter(now > RemoteAuthToken.expiration).\
+        filter(RemoteAuthToken.token_type != 1).delete()
     session.commit()
 
 
-def get_mail_settings():
-    settings = session.query(Settings).first()
+# Save downloaded books per user in calibre-web's own database
+def update_download(book_id, user_id):
+    check = session.query(Downloads).filter(Downloads.user_id == user_id).filter(Downloads.book_id == book_id).first()
 
-    if not settings:
-        return {}
-
-    data = {
-        'mail_server': settings.mail_server,
-        'mail_port': settings.mail_port,
-        'mail_use_ssl': settings.mail_use_ssl,
-        'mail_login': settings.mail_login,
-        'mail_password': settings.mail_password,
-        'mail_from': settings.mail_from
-    }
-
-    return data
+    if not check:
+        new_download = Downloads(user_id=user_id, book_id=book_id)
+        session.add(new_download)
+        try:
+            session.commit()
+        except exc.OperationalError:
+            session.rollback()
 
 
-# Generate user Guest (translated text), as anoymous user, no rights
-def create_anonymous_user():
+# Delete non exisiting downloaded books in calibre-web's own database
+def delete_download(book_id):
+    session.query(Downloads).filter(book_id == Downloads.book_id).delete()
+    try:
+        session.commit()
+    except exc.OperationalError:
+        session.rollback()
+
+# Generate user Guest (translated text), as anonymous user, no rights
+def create_anonymous_user(session):
     user = User()
-    user.nickname = _("Guest")
+    user.nickname = "Guest"
     user.email = 'no@email'
-    user.role = ROLE_ANONYMOUS
-    user.password = generate_password_hash('1')
+    user.role = constants.ROLE_ANONYMOUS
+    user.password = ''
 
     session.add(user)
     try:
@@ -577,15 +643,13 @@ def create_anonymous_user():
 
 
 # Generate User admin with admin123 password, and access to everything
-def create_admin_user():
+def create_admin_user(session):
     user = User()
     user.nickname = "admin"
-    user.role = ROLE_USER + ROLE_ADMIN + ROLE_DOWNLOAD + ROLE_UPLOAD + ROLE_EDIT + ROLE_DELETE_BOOKS + ROLE_PASSWD
-    user.sidebar_view = DETAIL_RANDOM + SIDEBAR_LANGUAGE + SIDEBAR_SERIES + SIDEBAR_CATEGORY + SIDEBAR_HOT + \
-            SIDEBAR_RANDOM + SIDEBAR_AUTHOR + SIDEBAR_BEST_RATED + SIDEBAR_READ_AND_UNREAD
+    user.role = constants.ADMIN_USER_ROLES
+    user.sidebar_view = constants.ADMIN_USER_SIDEBAR
 
-
-    user.password = generate_password_hash(DEFAULT_PASS)
+    user.password = generate_password_hash(constants.DEFAULT_PASSWORD)
 
     session.add(user)
     try:
@@ -594,24 +658,40 @@ def create_admin_user():
         session.rollback()
 
 
-# Open session for database connection
-Session = sessionmaker()
-Session.configure(bind=engine)
-session = Session()
+def init_db(app_db_path):
+    # Open session for database connection
+    global session
+    global app_DB_path
 
-# generate database and admin and guest user, if no database is existing
-if not os.path.exists(dbpath):
-    try:
+    app_DB_path = app_db_path
+    engine = create_engine(u'sqlite:///{0}'.format(app_db_path), echo=False)
+
+    Session = scoped_session(sessionmaker())
+    Session.configure(bind=engine)
+    session = Session()
+
+    if os.path.exists(app_db_path):
         Base.metadata.create_all(engine)
-        create_default_config()
-        create_admin_user()
-        create_anonymous_user()
-    except Exception:
-        raise
-else:
-    Base.metadata.create_all(engine)
-    migrate_Database()
-    clean_database()
+        migrate_Database(session)
+        clean_database(session)
+    else:
+        Base.metadata.create_all(engine)
+        create_admin_user(session)
+        create_anonymous_user(session)
 
-# Generate global Settings Object accecable from every file
-config = Config()
+
+def dispose():
+    global session
+
+    old_session = session
+    session = None
+    if old_session:
+        try:
+            old_session.close()
+        except Exception:
+            pass
+        if old_session.bind:
+            try:
+                old_session.bind.dispose()
+            except Exception:
+                pass
